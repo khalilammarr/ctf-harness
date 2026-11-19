@@ -60,3 +60,7 @@ From the event log of CSAW CTF 2026 quals, 18 to 20 September 2026 (the log is n
 - A fast clear is not the same as understanding. After an event I go back and work through what the solvers did.
 
 Not included: per-challenge working directories, handouts, VPN configuration, teammates' notes, challenge-specific solvers and writeups.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
