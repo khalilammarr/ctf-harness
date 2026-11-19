@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# board -- dead-simple shared state for parallel CTF solvers. No server, no DB.
+# Every write is an atomic append to one JSONL file; every read is a projection.
+#   board init
+#   board claim <chal> <who>          # returns 1 if someone else already holds it
+#   board note  <chal> <text>         # a discovery: offset, endpoint, leak, creds
+#   board kill  <chal> <hypothesis>   # record a DEAD END so nobody retries it
+#   board flag  <chal> <flag>         # record a verified flag
+#   board status                      # the one view to read before starting anything
+#   board tried <chal>                # what has already been ruled out
+set -u
+ROOT="${CTF_BOARD_DIR:-$PWD/.board}"
+LOG="$ROOT/events.jsonl"
+mkdir -p "$ROOT"; touch "$LOG"
+
+now(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
+emit(){ # atomic single-line append; O_APPEND on <4096 bytes is atomic on Linux
+  python3 -c '
+import json,sys
+print(json.dumps({"t":sys.argv[1],"kind":sys.argv[2],"chal":sys.argv[3],"who":sys.argv[4],"data":sys.argv[5]}))' \
+  "$(now)" "$1" "$2" "${WHO:-$(whoami)}" "$3" >> "$LOG"
+}
+
+case "${1:-status}" in
+  init)  echo "board at $ROOT"; ;;
+  claim)
+    C="${2:?chal}"; W="${3:-${WHO:-$(whoami)}}"
+    # claim is check-then-act (read holder, then append) so it MUST be
+    # serialized across agents -- flock the whole read+decide+write, or two
+    # simultaneous claims on the same challenge can both "succeed".
+    exec 8>"$ROOT/claim.lock"
+    flock 8
+    HOLDER=$(python3 - "$LOG" "$C" <<'PY'
+import json,sys
+h=None
+for l in open(sys.argv[1]):
+    try: e=json.loads(l)
+    except: continue
+    if e["chal"]==sys.argv[2]:
+        if e["kind"]=="claim": h=e["who"]
+        if e["kind"] in ("release","flag"): h=None
+print(h or "")
+PY
+)
+    if [ -n "$HOLDER" ] && [ "$HOLDER" != "$W" ]; then
+      echo "ALREADY CLAIMED by $HOLDER -- pick another challenge"; exit 1
+    fi
+    WHO="$W" emit claim "$C" ""; echo "claimed $C for $W";;
+  release) WHO="${3:-}" emit release "${2:?chal}" ""; echo "released ${2}";;
+  note)  C="${2:?chal}"; shift 2; emit note "$C" "$*"; echo "noted";;
+  kill)  C="${2:?chal}"; shift 2; emit kill "$C" "$*"; echo "dead end recorded";;
+  flag)  C="${2:?chal}"; shift 2; emit flag "$C" "$*"; echo "FLAG recorded for $C";;
+  tried)
+    python3 - "$LOG" "${2:?chal}" <<'PY'
+import json,sys
+for l in open(sys.argv[1]):
+    try: e=json.loads(l)
+    except: continue
+    if e["chal"]==sys.argv[2] and e["kind"]=="kill":
+        print(f"  RULED OUT [{e['who']}] {e['data']}")
+PY
+    ;;
+  status)
+    python3 - "$LOG" <<'PY'
+import json,sys,collections
+ev=[]
+for l in open(sys.argv[1]):
+    try: ev.append(json.loads(l))
+    except: pass
+ch=collections.defaultdict(lambda:{"holder":None,"notes":[],"kills":[],"flag":None})
+for e in ev:
+    c=ch[e["chal"]]
+    k=e["kind"]
+    if k=="claim": c["holder"]=e["who"]
+    elif k=="release": c["holder"]=None
+    elif k=="note": c["notes"].append((e["who"],e["data"]))
+    elif k=="kill": c["kills"].append((e["who"],e["data"]))
+    elif k=="flag": c["flag"]=e["data"]; c["holder"]=None
+if not ch: print("board empty"); sys.exit()
+solved=[c for c,v in ch.items() if v["flag"]]
+print(f"=== {len(solved)} solved / {len(ch)} tracked ===\n")
+for c,v in sorted(ch.items(), key=lambda x:(x[1]["flag"] is not None, x[0])):
+    if v["flag"]:
+        print(f"[SOLVED] {c}\n         {v['flag']}")
+    else:
+        who=f"<- {v['holder']}" if v["holder"] else "(unclaimed)"
+        print(f"[ OPEN ] {c} {who}")
+        for w,n in v["notes"][-4:]: print(f"         note[{w}]: {n}")
+        for w,n in v["kills"][-4:]: print(f"         DEAD[{w}]: {n}")
+    print()
+PY
+    ;;
+  *) sed -n '2,12p' "$0";;
+esac

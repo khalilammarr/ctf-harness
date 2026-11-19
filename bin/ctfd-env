@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# source bin/ctfd-env
+# Loads CTFd creds from ~/.config/ctfd.env so the token never lands in shell
+# history, a terminal transcript, or an AI context window.
+CRED="$HOME/.config/ctfd.env"
+if [ ! -r "$CRED" ]; then
+  echo "No $CRED yet. Create it with this (the token is NOT echoed):"
+  echo
+  echo '  mkdir -p ~/.config && read -rsp "CTFd token: " T && \'
+  echo '  printf "CTFD_URL=https://ctf.csaw.io\nCTFD_TOKEN=%s\n" "$T" > ~/.config/ctfd.env && \'
+  echo '  chmod 600 ~/.config/ctfd.env && unset T && echo STORED'
+  return 1 2>/dev/null || exit 1
+fi
+set -a; . "$CRED"; set +a
+echo "CTFd env loaded: $CTFD_URL (token: ${#CTFD_TOKEN} chars)"

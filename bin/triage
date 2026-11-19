@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# triage <file> -- 60-second first-contact triage for any CTF artifact.
+# Prints only what changes your next decision.
+set -u
+# NB: deliberately NOT 'pipefail' - `strings | grep -q` makes strings die of SIGPIPE,
+# which under pipefail turns every language test silently false. Cost us a misdetected Go binary.
+F="${1:?usage: triage <file>}"
+[ -r "$F" ] || { echo "cannot read $F"; exit 1; }
+hr(){ printf '\n\033[1;36m== %s ==\033[0m\n' "$1"; }
+
+hr IDENTITY
+file "$F"
+stat -c '  size: %s bytes' "$F"
+printf '  sha256: %s\n' "$(sha256sum "$F" | cut -d' ' -f1)"
+printf '  magic: '; xxd -p -l 16 "$F"
+
+python3 - "$F" <<'ENTEOF'
+import sys,math,collections
+d=open(sys.argv[1],'rb').read()
+if d:
+    c=collections.Counter(d); n=len(d)
+    e=-sum((v/n)*math.log2(v/n) for v in c.values())
+    tag="PACKED/ENCRYPTED/COMPRESSED -- unpack before analysing" if e>7.2 else ("mixed" if e>6.0 else "plain")
+    print(f"  entropy: {e:.2f}/8.00  ({tag})")
+ENTEOF
+
+case "$(file -b "$F")" in
+  *ELF*)
+    hr PROTECTIONS
+    # NOTE: the `checksec` on PATH here is pwntools' and logs to STDERR.
+    # Never redirect its stderr away. We use the ELF API - it also gives PIE/Stripped.
+    python3 - "$F" <<'SECEOF'
+import sys, logging
+logging.disable(logging.CRITICAL)
+from pwn import ELF, context
+context.log_level='error'
+e=ELF(sys.argv[1], checksec=False)
+print('  '+e.checksec(color=False).replace('\n','\n  '))
+print()
+if not e.pie:        print("  -> No PIE: code/gadget addresses are FIXED. No code leak needed.")
+else:                print("  -> PIE: need a code leak, or partial-overwrite the low 12 bits (always known).")
+if e.relro != 'Full':print("  -> GOT WRITABLE (Partial/No RELRO): GOT overwrite is on the table.")
+else:                print("  -> Full RELRO: GOT read-only. Target hooks/FSOP/return address instead.")
+if not e.nx:         print("  -> NX DISABLED: shellcode on stack/heap is likely intended.")
+if e.statically_linked: print("  -> STATIC: no libc leak needed; big internal gadget set (ret2syscall/SROP).")
+SECEOF
+    hr LINKAGE
+    if file "$F" | grep -q "statically linked"; then
+      echo "  STATIC -> no GOT overwrite / no libc leak needed; gadgets are plentiful in-binary"
+    else
+      ldd "$F" 2>/dev/null | sed 's/^/  /'
+    fi
+    hr LANGUAGE
+    S="$(strings -a "$F")"
+    if grep -qm1 'go1\.\|runtime\.gopanic\|Go build ID' <<<"$S"; then
+      echo "  >>> GO binary. main.main NOT main. Strings are length-prefixed, not NUL-terminated."
+      echo "      Use GoReSym / IDA Go loader to recover symbols if stripped."
+      grep -om1 'go1\.[0-9.]*' <<<"$S" | sed 's/^/      toolchain: /'
+    elif grep -qm1 'rust_begin_unwind\|core::panicking\|RUST_BACKTRACE' <<<"$S"; then
+      echo "  >>> RUST binary. Anchor on panic strings: each carries src path+line -> names the real function."
+    elif grep -qm1 '_ZNSt\|_ZNK\|__cxa_' <<<"$S"; then
+      echo "  >>> C++ . Demangle with nm -C / c++filt. Look for vtables."
+    elif grep -qm1 'UPX!' <<<"$S"; then
+      echo "  >>> UPX PACKED -> upx -d $F"
+    else
+      echo "  likely C (no Go/Rust/C++ markers)"
+    fi
+    hr "INTERESTING IMPORTS"
+    N="$( { nm -D "$F" 2>/dev/null; objdump -T "$F" 2>/dev/null; } )"
+    echo "$N" | grep -oE '\b(system|execve|execl|popen|fork|gets|strcpy|strcat|sprintf|scanf|printf|fprintf|snprintf|memcpy|alloca|malloc|free|calloc|realloc|mmap|mprotect|ptrace|prctl|seccomp|setuid|open|openat|read|write|puts|atoi|srand|rand|time)\b' \
+      | sort -u | tr '\n' ' ' | sed 's/^/  /'; echo
+    echo "  --- risk notes ---"
+    grep -q '\bgets\b'        <<<"$N" && echo "  !! gets() -> unbounded stack overflow, go straight to offset hunt"
+    grep -q '\bsystem\b'      <<<"$N" && echo "  !! system() in PLT -> ret2system likely intended"
+    grep -q 'printf'          <<<"$N" && echo "  ?  printf family -> check user data reaching 1st arg (format string)"
+    grep -q 'mprotect'        <<<"$N" && echo "  ?  mprotect -> shellcode path may be intended"
+    grep -q 'prctl\|seccomp'  <<<"$N" && echo "  !! seccomp -> dump rules (seccomp-tools dump) FIRST; likely ORW"
+    grep -q 'ptrace'          <<<"$N" && echo "  !! ptrace -> anti-debug; patch it or LD_PRELOAD a stub"
+    grep -q 'srand\|\brand\b' <<<"$N" && echo "  ?  rand/srand -> if seeded from time(0), replay the PRNG locally"
+    grep -qE '\bmalloc\b|\bfree\b' <<<"$N" && echo "  ?  heap in use -> check for UAF/double-free; note glibc version"
+    hr "WIN-LIKE FUNCTIONS"
+    nm "$F" 2>/dev/null | grep -iE ' (t|T) ' | grep -iE 'win|flag|shell|secret|admin|backdoor|debug' | sed 's/^/  /' | head
+    hr "FLAG-ISH STRINGS"
+    grep -inE 'flag|csaw|ctf\{|/bin/sh|cat .*flag' <<<"$S" | head -15 | sed 's/^/  /'
+    ;;
+  *"PE32"*|*"MS-DOS"*)
+    hr WINDOWS
+    strings -a "$F" | grep -qm1 'BSJB' && echo "  >>> .NET assembly: ilspycmd / dnSpy / dotnet-ildasm" || echo "  native PE: IDA/Ghidra"
+    ;;
+  *"Python script"*) hr PYTHON; head -40 "$F" ;;
+  *"Zip archive"*|*"Java archive"*)
+    hr ARCHIVE; unzip -l "$F" 2>/dev/null | head -30
+    unzip -l "$F" 2>/dev/null | grep -qi 'classes.dex' && echo "  >>> APK -> jadx -d out $F"
+    ;;
+  *"pcap"*|*"capture file"*)
+    hr PCAP
+    tshark -r "$F" -q -z io,phs 2>/dev/null | head -40
+    echo "  --- next: tshark -r '$F' -q -z conv,tcp | --export-objects http,dir"
+    echo "  --- usb.capdata present? -> HID keystroke recovery"
+    ;;
+  *image*|*PNG*|*JPEG*|*GIF*)
+    hr IMAGE; exiftool "$F" 2>/dev/null | head -25
+    ;;
+esac
+
+hr "EMBEDDED / APPENDED"
+binwalk "$F" 2>/dev/null | sed -n '4,18p'
+
+hr "NEXT MOVES"
+echo "  (triage only prints observations; choosing the next tool is up to you)"

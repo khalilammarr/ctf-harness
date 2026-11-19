@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""Minimal CTFd v1 client — used by solver agents and humans alike, and the fallback when an MCP integration is down mid-event.
+
+Only stdlib + requests. Auth by API token (preferred) or session cookie.
+
+    export CTFD_URL=https://ctf.csaw.io
+    export CTFD_TOKEN=ctfd_xxxxxxxx          # or: export CTFD_SESSION=<session cookie>
+
+    bin/ctfd challenges
+    bin/ctfd challenges --category pwn --unsolved
+    bin/ctfd challenge 42
+    bin/ctfd submit 42 'flag{...}'
+    bin/ctfd files --out ./downloads          # bulk-download EVERY attachment
+    bin/ctfd scoreboard
+    bin/ctfd me
+    bin/ctfd hint 7            # read (locked view unless unlocked)
+    bin/ctfd unlock-hint 7     # SPENDS POINTS
+    bin/ctfd rank              # points-per-effort table incl. dynamic decay
+"""
+import argparse
+import json
+import math
+import os
+import pathlib
+import re
+import sys
+import time
+
+import requests
+
+URL = os.environ.get("CTFD_URL", "").rstrip("/")
+TOKEN = os.environ.get("CTFD_TOKEN", "")
+SESSION = os.environ.get("CTFD_SESSION", "")
+CSRF = os.environ.get("CTFD_CSRF_TOKEN", "")
+
+if not URL:
+    sys.exit("set CTFD_URL")
+if not (TOKEN or SESSION):
+    sys.exit("set CTFD_TOKEN or CTFD_SESSION")
+
+S = requests.Session()
+# Content-Type must be the BARE literal — CTFd compares it for equality and only
+# honours the Authorization header when mimetype == application/json.
+S.headers.update({"Content-Type": "application/json", "Accept": "application/json"})
+if TOKEN:
+    S.headers["Authorization"] = f"Token {TOKEN}"
+else:
+    S.cookies.set("session", SESSION)
+    if CSRF:
+        S.headers["CSRF-Token"] = CSRF
+
+
+def api(method, path, **kw):
+    """API calls must NOT follow redirects: a redirect is CTFd bouncing you to /login."""
+    r = S.request(method, f"{URL}/api/v1{path}", allow_redirects=False, timeout=20, **kw)
+    if r.status_code in (301, 302, 303, 307, 308):
+        sys.exit(f"auth failure: {path} redirected to {r.headers.get('Location')}")
+    try:
+        body = r.json()
+    except ValueError:
+        sys.exit(f"non-JSON from {path} (status {r.status_code}); check Content-Type/auth")
+    return r.status_code, body
+
+
+def get(path, **kw):
+    code, body = api("GET", path, **kw)
+    if not body.get("success", False):
+        sys.exit(f"{path} -> {code} {json.dumps(body)[:400]}")
+    return body["data"]
+
+
+def cmd_me(a):
+    print(json.dumps(get("/users/me"), indent=2))
+
+
+def cmd_challenges(a):
+    chals = get("/challenges")
+    for c in sorted(chals, key=lambda c: (c.get("category") or "", -(c.get("value") or 0))):
+        if a.category and c.get("category") != a.category:
+            continue
+        if a.unsolved and c.get("solved_by_me"):
+            continue
+        solves = c.get("solves")
+        print(f"{c['id']:>5}  {str(c.get('value')):>5}p  "
+              f"{('%s' % solves) if solves is not None else 'hidden':>6} solves  "
+              f"{'*' if c.get('solved_by_me') else ' '} "
+              f"[{c.get('category')}] {c.get('name')}")
+
+
+def cmd_challenge(a):
+    print(json.dumps(get(f"/challenges/{a.id}"), indent=2))
+
+
+def cmd_submit(a):
+    """ONE submission. Never retried. A 429 already spent the attempt."""
+    code, body = api("POST", "/challenges/attempt",
+                     data=json.dumps({"challenge_id": int(a.id), "submission": a.flag}))
+    data = body.get("data", {})
+    status = data.get("status")           # read THIS, not body["success"]
+    print(f"HTTP {code}  status={status}  {data.get('message')}")
+    if status == "ratelimited":
+        m = re.search(r"(\d+)\s*seconds", data.get("message") or "")
+        print(f"!! rate limited. wait {m.group(1) if m else 60}s. DO NOT RETRY IMMEDIATELY.",
+              file=sys.stderr)
+    sys.exit(0 if status == "correct" else 1)
+
+
+def cmd_scoreboard(a):
+    for row in get("/scoreboard")[: a.top]:
+        print(f"{row.get('pos'):>4}  {row.get('score'):>7}  {row.get('name')}")
+
+
+def cmd_hint(a):
+    print(json.dumps(get(f"/hints/{a.id}"), indent=2))
+
+
+def cmd_unlock_hint(a):
+    code, body = api("POST", "/unlocks",
+                     data=json.dumps({"target": int(a.id), "type": "hints"}))
+    print(code, json.dumps(body, indent=2))
+
+
+def cmd_files(a):
+    """Bulk-download EVERY attachment of EVERY visible challenge.
+
+    Run this in the first five minutes. Attachments are only served while
+    ctftime() is true, and pulling them once removes the network from the loop.
+    File downloads DO follow redirects (S3 presigned URLs).
+    """
+    out = pathlib.Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    manifest = []
+    for c in get("/challenges"):
+        detail = get(f"/challenges/{c['id']}")
+        files = detail.get("files") or []
+        if not files:
+            continue
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "_", f"{detail.get('category','misc')}-{detail['name']}")[:80]
+        d = out / f"{c['id']:04d}-{slug}"
+        d.mkdir(exist_ok=True)
+        (d / "challenge.json").write_text(json.dumps(detail, indent=2))
+        for f in files:
+            url = f if f.startswith("http") else f"{URL}/{f.lstrip('/')}"
+            name = os.path.basename(url.split("?", 1)[0]) or "attachment"
+            dest = d / name
+            if dest.exists():
+                continue
+            # follow_redirects=True here on purpose; requests drops auth cross-host.
+            r = S.get(url, allow_redirects=True, timeout=120, stream=True,
+                      headers={"Content-Type": None})
+            r.raise_for_status()
+            tmp = dest.with_suffix(dest.suffix + ".part")
+            with open(tmp, "wb") as fh:
+                for chunk in r.iter_content(1 << 16):
+                    fh.write(chunk)
+            tmp.rename(dest)
+            manifest.append(str(dest))
+            print("saved", dest)
+        time.sleep(0.2)
+    (out / "MANIFEST.json").write_text(json.dumps(manifest, indent=2))
+    print(f"\n{len(manifest)} files -> {out}")
+
+
+def projected_value(c, extra=0):
+    if c.get("type") != "dynamic" or c.get("decay") in (None, 0):
+        return c.get("value") or 0
+    s = max((c.get("solves") or 0) + extra - 1, 0)
+    init, mini, dec = c["initial"], c["minimum"], c["decay"] or 1
+    if c.get("function") == "linear":
+        v = math.ceil(init - dec * s)
+    else:
+        v = math.ceil(((mini - init) / (dec ** 2)) * (s ** 2) + init)
+    return max(v, mini)
+
+
+def cmd_rank(a):
+    """Rank by current value and by how fast that value is bleeding."""
+    rows = []
+    for c in get("/challenges"):
+        d = get(f"/challenges/{c['id']}")
+        now = projected_value(d)
+        later = projected_value(d, extra=a.horizon)
+        rows.append((now - later, now, d.get("solves"), d.get("category"), d.get("name"), d["id"]))
+    rows.sort(key=lambda r: (-r[0], -r[1]))
+    print(f"{'bleed':>6} {'value':>6} {'solves':>7}  challenge   "
+          f"(bleed = points lost if {a.horizon} more teams solve it first)")
+    for bleed, val, solves, cat, name, cid in rows:
+        print(f"{bleed:>6} {val:>6} {str(solves):>7}  [{cat}] {name}  (#{cid})")
+
+
+p = argparse.ArgumentParser()
+sub = p.add_subparsers(dest="cmd", required=True)
+sp = sub.add_parser("me"); sp.set_defaults(fn=cmd_me)
+sp = sub.add_parser("challenges"); sp.add_argument("--category"); sp.add_argument("--unsolved", action="store_true"); sp.set_defaults(fn=cmd_challenges)
+sp = sub.add_parser("challenge"); sp.add_argument("id"); sp.set_defaults(fn=cmd_challenge)
+sp = sub.add_parser("submit"); sp.add_argument("id"); sp.add_argument("flag"); sp.set_defaults(fn=cmd_submit)
+sp = sub.add_parser("scoreboard"); sp.add_argument("--top", type=int, default=25); sp.set_defaults(fn=cmd_scoreboard)
+sp = sub.add_parser("hint"); sp.add_argument("id"); sp.set_defaults(fn=cmd_hint)
+sp = sub.add_parser("unlock-hint"); sp.add_argument("id"); sp.set_defaults(fn=cmd_unlock_hint)
+sp = sub.add_parser("files"); sp.add_argument("--out", default="./ctfd-downloads"); sp.set_defaults(fn=cmd_files)
+sp = sub.add_parser("rank"); sp.add_argument("--horizon", type=int, default=20); sp.set_defaults(fn=cmd_rank)
+
+args = p.parse_args()
+args.fn(args)

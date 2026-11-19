@@ -1,0 +1,10 @@
+# runtime state: the board holds notes and flags for a live event
+.board/
+# per-challenge working directories, downloaded attachments, credentials
+work/
+ctfd-downloads/
+*.env
+.env*
+vpn/
+*.ovpn
+__pycache__/

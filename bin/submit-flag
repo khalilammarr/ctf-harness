@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# submit-flag <board-chal-name> <ctfd-numeric-id> <flag>
+#
+# THE ONLY sanctioned path to CTFd flag submission when several solver
+# processes share one machine. Everything goes through this, never call
+# `bin/ctfd submit` directly, so two solvers can't race the same submission
+# slot on the same challenge (a rate-limited attempt is already spent).
+#
+# What it does, in order:
+#   1. Locks on the board (flock) so two concurrent callers serialize instead
+#      of racing.
+#   2. Checks `board status` — if this challenge is already [SOLVED], refuses
+#      and prints the recorded flag instead of re-submitting.
+#   3. Calls `bin/ctfd submit` for real.
+#   4. On a CORRECT result, records it to the board so the other solver sees
+#      it immediately and never attempts it again.
+set -u
+CHAL="${1:?usage: submit-flag <board-chal-name> <ctfd-id> <flag>}"
+ID="${2:?usage: submit-flag <board-chal-name> <ctfd-id> <flag>}"
+FLAG="${3:?usage: submit-flag <board-chal-name> <ctfd-id> <flag>}"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+BOARD_DIR="${CTF_BOARD_DIR:-$HERE/../.board}"
+export PATH="$HERE:$PATH"   # so `board` resolves
+LOCK="$BOARD_DIR/submit.lock"
+mkdir -p "$BOARD_DIR"
+
+exec 9>"$LOCK"
+if ! flock -w 30 9; then
+  echo "!! could not acquire submit lock within 30s — another submit is stuck?" >&2
+  exit 1
+fi
+
+ALREADY=$(board status 2>/dev/null | awk -v c="$CHAL" '
+  $0 ~ "^\\[SOLVED\\] "c"$" { found=1; next }
+  found { print; exit }
+')
+if [ -n "$ALREADY" ]; then
+  echo "SKIP: $CHAL already marked [SOLVED] on the board — not re-submitting."
+  echo "recorded flag: $ALREADY"
+  exit 0
+fi
+
+echo "submitting as WHO=${WHO:-$(whoami)} ..."
+bin_ctfd="$(dirname "$0")/ctfd"
+"$bin_ctfd" submit "$ID" "$FLAG"
+STATUS=$?
+
+if [ "$STATUS" -eq 0 ]; then
+  board flag "$CHAL" "$FLAG"
+else
+  echo "!! submission did not return correct — NOT recording to board." >&2
+  echo "!! if this was a 429, the attempt is already spent — do not retry blind." >&2
+fi
+exit "$STATUS"
